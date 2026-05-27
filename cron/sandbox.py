@@ -111,6 +111,44 @@ def _expand_path(p: str) -> str:
     return str(Path(os.path.expandvars(os.path.expanduser(p))).resolve())
 
 
+def _resolve_profile_paths(hermes_home: str) -> Dict[str, str]:
+    """Determine the active profile's directory and the base hermes dir.
+
+    Returns a dict with:
+      - 'profile_dir': the active profile's data directory (read-write)
+      - 'base_dir': the base ~/.hermes directory
+      - 'shared_dirs': directories shared across profiles (code, scripts)
+      - 'other_profiles': path to other profiles dir (to deny)
+    """
+    hermes_home_path = Path(hermes_home).resolve()
+
+    # Detect if we're running inside a named profile
+    # Named profiles live at ~/.hermes/profiles/<name>/
+    profiles_parent = hermes_home_path.parent
+    if profiles_parent.name == "profiles":
+        base_dir = str(profiles_parent.parent)
+        profile_name = hermes_home_path.name
+    else:
+        base_dir = str(hermes_home_path)
+        profile_name = None
+
+    profiles_dir = str(Path(base_dir) / "profiles")
+
+    # Shared read-only paths that all profiles need
+    shared_dirs = [
+        str(Path(base_dir) / "hermes-agent"),  # code
+        str(Path(base_dir) / "scripts"),        # pre-run scripts
+    ]
+
+    return {
+        "profile_dir": hermes_home,
+        "profile_name": profile_name,
+        "base_dir": base_dir,
+        "profiles_dir": profiles_dir,
+        "shared_dirs": shared_dirs,
+    }
+
+
 def _build_capabilities(
     sandbox_cfg: Dict[str, Any],
     script_dir: str,
@@ -121,11 +159,54 @@ def _build_capabilities(
     Always grants:
       - Read access to the script's directory
       - Read access to system Python/bash paths needed for the interpreter
+      - Read-write to the ACTIVE profile's directory only
+      - Read to shared dirs (code, scripts)
+      - NO access to other profiles' directories
     """
     caps = nono.CapabilitySet()
 
     # Always allow reading the script directory
     caps.allow_path(script_dir, nono.AccessMode.READ)
+
+    # --- Profile isolation ---
+    # Only allow access to the active profile's data directory.
+    # Other profiles' memories, sessions, and configs are invisible.
+    profile_paths = _resolve_profile_paths(hermes_home)
+
+    profile_dir = profile_paths["profile_dir"]
+    base_dir = profile_paths["base_dir"]
+    profile_name = profile_paths.get("profile_name")
+
+    if profile_name:
+        # Named profile: grant only its own directory
+        if os.path.isdir(profile_dir):
+            caps.allow_path(profile_dir, nono.AccessMode.READ_WRITE)
+    else:
+        # Default profile: grant individual subdirectories, NOT the
+        # entire ~/.hermes/ tree (which would include profiles/).
+        _default_profile_dirs = [
+            "cron", "sessions", "memories", "skills", "hooks",
+            "logs", "audio_cache", "image_cache", "workspace",
+            "plans", "pairing", "skins", "home",
+        ]
+        for subdir in _default_profile_dirs:
+            subpath = os.path.join(base_dir, subdir)
+            if os.path.isdir(subpath):
+                caps.allow_path(subpath, nono.AccessMode.READ_WRITE)
+
+    # Shared code and scripts get read-only
+    for shared in profile_paths["shared_dirs"]:
+        if os.path.isdir(shared):
+            caps.allow_path(shared, nono.AccessMode.READ)
+
+    # Base config files (config.yaml, .env) need read access
+    for cfg_file in ["config.yaml", ".env", "SOUL.md"]:
+        cfg_path = os.path.join(base_dir, cfg_file)
+        if os.path.isfile(cfg_path):
+            caps.allow_file(cfg_path, nono.AccessMode.READ)
+
+    # NOTE: ~/.hermes/profiles/ is never granted to the default profile,
+    # and named profiles only get their own dir — Landlock denies the rest.
 
     # System paths required for interpreter execution (bash, python, libs)
     _system_read_paths = [
@@ -141,8 +222,6 @@ def _build_capabilities(
     _venv = os.environ.get("VIRTUAL_ENV")
     if _venv and os.path.isdir(_venv):
         _system_read_paths.append(_venv)
-    # Add hermes_home for config access
-    _system_read_paths.append(hermes_home)
 
     # /dev needs read-write for /dev/null, /dev/urandom etc.
     if os.path.isdir("/dev"):
