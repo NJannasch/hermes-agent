@@ -385,8 +385,14 @@ def run_sandboxed_script(
                 events = proxy.drain_audit_events()
                 if events:
                     logger.info("Sandbox audit: %d network events for script", len(events))
-            except Exception:
-                pass
+                    _write_audit_log(
+                        hermes_home=hermes_home,
+                        script_name=os.path.basename(argv[-1]) if argv else "unknown",
+                        events=events,
+                        exit_code=result.exit_code,
+                    )
+            except Exception as exc:
+                logger.debug("Audit log write failed: %s", exc)
 
         if result.exit_code != 0:
             parts = [f"Script exited with code {result.exit_code} (sandboxed)"]
@@ -407,6 +413,131 @@ def run_sandboxed_script(
                 proxy.shutdown()
             except Exception:
                 pass
+
+
+def _write_audit_log(
+    hermes_home: str,
+    script_name: str,
+    events: list,
+    exit_code: int,
+) -> None:
+    """Write audit events to a JSONL log file.
+
+    Each sandboxed cron run appends to ~/.hermes/cron/audit.jsonl.
+    Events include network requests, blocked hosts, and credential usage.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    audit_dir = Path(hermes_home) / "cron"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    audit_file = audit_dir / "audit.jsonl"
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    record = {
+        "timestamp": timestamp,
+        "script": script_name,
+        "exit_code": exit_code,
+        "events": [],
+    }
+
+    for event in events:
+        entry = {}
+        if hasattr(event, '__dict__'):
+            entry = {k: v for k, v in event.__dict__.items() if not k.startswith('_')}
+        elif isinstance(event, dict):
+            entry = event
+        else:
+            entry = {"raw": str(event)}
+        record["events"].append(entry)
+
+    try:
+        with open(audit_file, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as exc:
+        logger.warning("Failed to write audit log: %s", exc)
+
+
+def review_audit_logs(
+    hermes_home: str,
+    last_n: int = 50,
+) -> str:
+    """Review recent sandbox audit logs for unexpected behavior.
+
+    Returns a human-readable summary suitable for LLM analysis.
+    Called by the agent to self-review its sandboxed operations.
+    """
+    import json
+
+    audit_file = Path(hermes_home) / "cron" / "audit.jsonl"
+    if not audit_file.exists():
+        return "No audit logs found. Sandbox auditing may not be configured."
+
+    lines = []
+    try:
+        with open(audit_file) as f:
+            lines = f.readlines()
+    except Exception as exc:
+        return f"Failed to read audit logs: {exc}"
+
+    if not lines:
+        return "Audit log exists but is empty."
+
+    recent = lines[-last_n:]
+    records = []
+    for line in recent:
+        try:
+            records.append(json.loads(line.strip()))
+        except Exception:
+            continue
+
+    if not records:
+        return "Audit log contains no parseable records."
+
+    # Build summary
+    total_runs = len(records)
+    failed_runs = sum(1 for r in records if r.get("exit_code", 0) != 0)
+    all_events = []
+    for r in records:
+        for e in r.get("events", []):
+            all_events.append(e)
+
+    # Count hosts contacted
+    hosts = {}
+    blocked = []
+    for e in all_events:
+        target = e.get("target", e.get("host", "unknown"))
+        decision = e.get("decision", "unknown")
+        if decision == "denied" or decision == "blocked":
+            blocked.append(target)
+        hosts[target] = hosts.get(target, 0) + 1
+
+    summary = [
+        f"## Sandbox Audit Summary",
+        f"",
+        f"**Period:** {records[0].get('timestamp', '?')} → {records[-1].get('timestamp', '?')}",
+        f"**Runs:** {total_runs} total, {failed_runs} failed",
+        f"**Network events:** {len(all_events)}",
+        f"",
+    ]
+
+    if hosts:
+        summary.append("### Hosts contacted")
+        for host, count in sorted(hosts.items(), key=lambda x: -x[1]):
+            summary.append(f"- {host}: {count}x")
+        summary.append("")
+
+    if blocked:
+        summary.append("### ⚠ Blocked requests")
+        for target in set(blocked):
+            summary.append(f"- **{target}** — DENIED")
+        summary.append("")
+
+    if not hosts and not blocked:
+        summary.append("No network activity recorded (scripts may use block_network).")
+
+    return "\n".join(summary)
 
 
 def _fallback_unsandboxed(
