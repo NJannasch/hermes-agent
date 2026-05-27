@@ -410,16 +410,27 @@ def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
     return prelude + cmd_string
 
 
-def _get_terminal_sandbox_preexec():
-    """Build a preexec_fn that applies nono sandbox in the child process.
+_terminal_sandbox_cache = None
+_terminal_sandbox_resolved = False
 
-    Reads sandbox config from config.yaml → terminal.sandbox. Returns None
-    if sandboxing is disabled or nono-py is not installed.
 
-    The returned callable is invoked in the child process after fork()
-    but before exec(), making the sandbox irrevocable and inherited by
-    all further subprocesses.
+def _get_terminal_sandbox():
+    """Build sandbox preexec_fn + network proxy for terminal commands.
+
+    Reads sandbox config from config.yaml → terminal.sandbox.
+
+    Returns (preexec_fn, proxy_env_dict) or (None, {}) if disabled.
+    - preexec_fn: applied in child process for filesystem isolation
+    - proxy_env_dict: env vars to route child's network through nono proxy
+
+    The proxy runs in the parent process. The preexec_fn runs in the child.
+    Together they provide both filesystem AND network host-level filtering
+    without needing to sandbox the entire gateway (Option B).
     """
+    global _terminal_sandbox_cache, _terminal_sandbox_resolved
+    if _terminal_sandbox_resolved:
+        return _terminal_sandbox_cache or (None, {})
+    _terminal_sandbox_resolved = True
     try:
         import nono_py as nono
         if not nono.is_supported():
@@ -508,9 +519,43 @@ def _get_terminal_sandbox_preexec():
         elif os.path.isfile(expanded):
             caps.allow_file(expanded, nono.AccessMode.READ_WRITE)
 
-    # Network
+    # Network: use proxy for host-level filtering, block_network for deny-all
     net_cfg = sandbox_cfg.get("network", {}) or {}
-    if not net_cfg.get("allow_hosts"):
+    allowed_hosts = net_cfg.get("allow_hosts", [])
+    proxy_env = {}
+
+    if allowed_hosts:
+        # Start a proxy in the parent process for host-level filtering.
+        # Child processes route through it via HTTP_PROXY/HTTPS_PROXY env vars.
+        try:
+            creds_cfg = sandbox_cfg.get("credentials", {}) or {}
+            routes = []
+            for name, cred_cfg in creds_cfg.items():
+                upstream = cred_cfg.get("upstream")
+                key_env = cred_cfg.get("key_env", "")
+                real_key = os.environ.get(key_env, "")
+                if upstream and real_key:
+                    routes.append(nono.RouteConfig(
+                        prefix=cred_cfg.get("prefix", "/"),
+                        upstream=upstream,
+                        credential_key=f"hermes-terminal-{name}",
+                        inject_mode=nono.InjectMode.HEADER,
+                        inject_header=cred_cfg.get("inject_header", "Authorization"),
+                        credential_format=cred_cfg.get("format", "Bearer {credential}"),
+                    ))
+
+            proxy_config = nono.ProxyConfig(
+                allowed_hosts=allowed_hosts,
+                routes=routes,
+            )
+            proxy_handle = nono.start_proxy(proxy_config)
+            raw_env = proxy_handle.sandbox_env()
+            proxy_env = dict(raw_env.items()) if hasattr(raw_env, 'items') else dict(raw_env)
+            logger.info("Terminal sandbox: nono proxy started (allowed_hosts=%s)", allowed_hosts)
+        except Exception as exc:
+            logger.warning("Terminal sandbox: proxy start failed: %s — blocking all network", exc)
+            caps.block_network()
+    elif net_cfg.get("block", True):
         caps.block_network()
 
     logger.info("Terminal sandbox: nono preexec_fn built (profile=%s)",
@@ -519,7 +564,8 @@ def _get_terminal_sandbox_preexec():
     def _apply_sandbox(c=caps):
         nono.apply(c)
 
-    return _apply_sandbox
+    _terminal_sandbox_cache = (_apply_sandbox, proxy_env)
+    return _apply_sandbox, proxy_env
 
 
 class LocalEnvironment(BaseEnvironment):
@@ -632,12 +678,14 @@ class LocalEnvironment(BaseEnvironment):
 
         # --- nono sandbox integration (Option A) ---
         # When terminal sandbox config is active, apply kernel-level
-        # restrictions in the child process via preexec_fn. The parent
-        # gateway stays unsandboxed; Popen streaming works normally.
+        # restrictions in the child process via preexec_fn. Network
+        # host filtering uses a proxy in the parent process, injected
+        # via env vars. The parent gateway stays unsandboxed.
         _preexec = None if _IS_WINDOWS else os.setsid
         if not _IS_WINDOWS:
-            sandbox_preexec = _get_terminal_sandbox_preexec()
+            sandbox_preexec, sandbox_proxy_env = _get_terminal_sandbox()
             if sandbox_preexec is not None:
+                run_env.update(sandbox_proxy_env)
                 _original_setsid = os.setsid
                 def _combined_preexec(
                     _setsid=_original_setsid,
