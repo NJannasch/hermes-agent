@@ -281,6 +281,13 @@ def _build_env(
         if val is not None:
             env_list.append((key, val))
 
+    # Force all HTTP(S) traffic through proxy when proxy env is provided.
+    # Also set no_proxy to empty to prevent bypass.
+    net_cfg = sandbox_cfg.get("network", {}) or {}
+    if net_cfg.get("allow_hosts"):
+        env_list.append(("no_proxy", ""))
+        env_list.append(("NO_PROXY", ""))
+
     return env_list
 
 
@@ -359,7 +366,13 @@ def run_sandboxed_script(
     try:
         if proxy:
             proxy_env = proxy.sandbox_env()
-            env_list.extend(proxy_env.items() if hasattr(proxy_env, 'items') else proxy_env)
+            if hasattr(proxy_env, 'items'):
+                proxy_pairs = list(proxy_env.items())
+            else:
+                proxy_pairs = list(proxy_env)
+            env_list.extend(proxy_pairs)
+            logger.info("Sandbox proxy env injected: %s",
+                        {k: v[:30] + '...' if len(v) > 30 else v for k, v in proxy_pairs})
 
         logger.info("Running script in nono sandbox: %s", " ".join(argv))
         result = nono.sandboxed_exec(
