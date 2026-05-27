@@ -410,6 +410,118 @@ def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
     return prelude + cmd_string
 
 
+def _get_terminal_sandbox_preexec():
+    """Build a preexec_fn that applies nono sandbox in the child process.
+
+    Reads sandbox config from config.yaml → terminal.sandbox. Returns None
+    if sandboxing is disabled or nono-py is not installed.
+
+    The returned callable is invoked in the child process after fork()
+    but before exec(), making the sandbox irrevocable and inherited by
+    all further subprocesses.
+    """
+    try:
+        import nono_py as nono
+        if not nono.is_supported():
+            return None
+    except ImportError:
+        return None
+
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return None
+
+    terminal_cfg = cfg.get("terminal", {}) or {}
+    sandbox_cfg = terminal_cfg.get("sandbox", {}) or {}
+
+    if not sandbox_cfg.get("enabled", False):
+        return None
+
+    caps = nono.CapabilitySet()
+
+    # System paths required for command execution
+    for sp in ["/bin", "/usr/bin", "/usr/lib", "/usr/lib64",
+               "/lib", "/lib64", "/etc/alternatives",
+               "/etc/ssl", "/etc/ca-certificates", "/usr/share",
+               "/tmp", "/proc"]:
+        if os.path.isdir(sp):
+            caps.allow_path(sp, nono.AccessMode.READ)
+    for sf in ["/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf",
+               "/etc/passwd", "/etc/group"]:
+        if os.path.isfile(sf):
+            caps.allow_file(sf, nono.AccessMode.READ)
+    if os.path.isdir("/dev"):
+        caps.allow_path("/dev", nono.AccessMode.READ_WRITE)
+
+    # Python venv
+    venv = os.environ.get("VIRTUAL_ENV")
+    if venv and os.path.isdir(venv):
+        caps.allow_path(venv, nono.AccessMode.READ)
+
+    # Profile-scoped access
+    try:
+        from hermes_constants import get_hermes_home
+        from cron.sandbox import _resolve_profile_paths
+        hermes_home = str(get_hermes_home())
+        profile_paths = _resolve_profile_paths(hermes_home)
+
+        profile_dir = profile_paths["profile_dir"]
+        profile_name = profile_paths.get("profile_name")
+
+        if profile_name:
+            if os.path.isdir(profile_dir):
+                caps.allow_path(profile_dir, nono.AccessMode.READ_WRITE)
+        else:
+            for subdir in ["cron", "sessions", "memories", "skills", "hooks",
+                           "logs", "workspace", "plans", "home"]:
+                subpath = os.path.join(profile_dir, subdir)
+                if os.path.isdir(subpath):
+                    caps.allow_path(subpath, nono.AccessMode.READ_WRITE)
+
+        for shared in profile_paths["shared_dirs"]:
+            if os.path.isdir(shared):
+                caps.allow_path(shared, nono.AccessMode.READ)
+
+        for cfg_file in ["config.yaml", ".env", "SOUL.md"]:
+            base_cfg = os.path.join(profile_paths["base_dir"], cfg_file)
+            if os.path.isfile(base_cfg):
+                caps.allow_file(base_cfg, nono.AccessMode.READ)
+    except Exception as exc:
+        logger.debug("Terminal sandbox: profile path resolution failed: %s", exc)
+        return None
+
+    # User-configured filesystem allowlist
+    fs_cfg = sandbox_cfg.get("filesystem", {}) or {}
+    for p in fs_cfg.get("allow_read", []):
+        expanded = os.path.expanduser(os.path.expandvars(p))
+        if os.path.isdir(expanded):
+            caps.allow_path(expanded, nono.AccessMode.READ)
+        elif os.path.isfile(expanded):
+            caps.allow_file(expanded, nono.AccessMode.READ)
+
+    for p in fs_cfg.get("allow_write", []):
+        expanded = os.path.expanduser(os.path.expandvars(p))
+        if os.path.isdir(expanded):
+            caps.allow_path(expanded, nono.AccessMode.READ_WRITE)
+        elif os.path.isfile(expanded):
+            caps.allow_file(expanded, nono.AccessMode.READ_WRITE)
+
+    # Network
+    net_cfg = sandbox_cfg.get("network", {}) or {}
+    if not net_cfg.get("allow_hosts"):
+        caps.block_network()
+
+    logger.info("Terminal sandbox: nono preexec_fn built (profile=%s)",
+                profile_name or "default")
+
+    def _apply_sandbox(c=caps):
+        nono.apply(c)
+
+    return _apply_sandbox
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host machine.
 
@@ -518,6 +630,23 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
+        # --- nono sandbox integration (Option A) ---
+        # When terminal sandbox config is active, apply kernel-level
+        # restrictions in the child process via preexec_fn. The parent
+        # gateway stays unsandboxed; Popen streaming works normally.
+        _preexec = None if _IS_WINDOWS else os.setsid
+        if not _IS_WINDOWS:
+            sandbox_preexec = _get_terminal_sandbox_preexec()
+            if sandbox_preexec is not None:
+                _original_setsid = os.setsid
+                def _combined_preexec(
+                    _setsid=_original_setsid,
+                    _sandbox=sandbox_preexec,
+                ):
+                    _setsid()
+                    _sandbox()
+                _preexec = _combined_preexec
+
         proc = subprocess.Popen(
             args,
             text=True,
@@ -527,7 +656,7 @@ class LocalEnvironment(BaseEnvironment):
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            preexec_fn=None if _IS_WINDOWS else os.setsid,
+            preexec_fn=_preexec,
             cwd=_popen_cwd,
             **_popen_kwargs,
         )
