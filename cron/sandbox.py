@@ -127,18 +127,52 @@ def _build_capabilities(
     # Always allow reading the script directory
     caps.allow_path(script_dir, nono.AccessMode.READ)
 
+    # System paths required for interpreter execution (bash, python, libs)
+    _system_read_paths = [
+        "/bin", "/usr/bin", "/usr/lib", "/usr/lib64",
+        "/lib", "/lib64", "/etc/alternatives",
+        "/usr/share/python3", "/usr/share/bash-completion",
+        "/etc/ssl", "/etc/ca-certificates", "/usr/share/ca-certificates",
+        "/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf",
+        "/proc/self", "/proc/version",
+        "/tmp",
+    ]
+    # Add the Python venv if we're running from one
+    _venv = os.environ.get("VIRTUAL_ENV")
+    if _venv and os.path.isdir(_venv):
+        _system_read_paths.append(_venv)
+    # Add hermes_home for config access
+    _system_read_paths.append(hermes_home)
+
+    # /dev needs read-write for /dev/null, /dev/urandom etc.
+    if os.path.isdir("/dev"):
+        caps.allow_path("/dev", nono.AccessMode.READ_WRITE)
+
+    for sp in _system_read_paths:
+        if os.path.isdir(sp):
+            caps.allow_path(sp, nono.AccessMode.READ)
+        elif os.path.isfile(sp):
+            caps.allow_file(sp, nono.AccessMode.READ)
+
     fs_cfg = sandbox_cfg.get("filesystem", {})
 
     for p in fs_cfg.get("allow_read", []):
         expanded = _expand_path(p)
-        if os.path.exists(expanded):
+        if os.path.isdir(expanded):
             caps.allow_path(expanded, nono.AccessMode.READ)
+        elif os.path.isfile(expanded):
+            caps.allow_file(expanded, nono.AccessMode.READ)
 
     for p in fs_cfg.get("allow_write", []):
         expanded = _expand_path(p)
-        parent = str(Path(expanded).parent)
-        if os.path.exists(parent):
+        if os.path.isdir(expanded):
             caps.allow_path(expanded, nono.AccessMode.READ_WRITE)
+        elif os.path.isfile(expanded):
+            caps.allow_file(expanded, nono.AccessMode.READ_WRITE)
+        else:
+            parent = str(Path(expanded).parent)
+            if os.path.isdir(parent):
+                caps.allow_path(parent, nono.AccessMode.READ_WRITE)
 
     net_cfg = sandbox_cfg.get("network", {})
     if not net_cfg.get("allow_hosts"):
