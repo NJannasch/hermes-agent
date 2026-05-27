@@ -848,7 +848,7 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, sandbox_cfg: Optional[dict] = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -870,6 +870,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        sandbox_cfg: Optional merged sandbox configuration. When provided
+            and nono-py is available, the script runs inside a kernel-level
+            sandbox (Landlock/Seatbelt). See cron/sandbox.py for details.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -936,6 +939,20 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             run_env["HOME"] = profile_home
     except Exception:
         pass
+
+    # --- nono sandbox integration ---
+    # When sandbox_cfg is provided, route through the nono sandbox module
+    # for kernel-level isolation instead of subprocess.run.
+    if sandbox_cfg is not None:
+        from cron.sandbox import run_sandboxed_script
+        return run_sandboxed_script(
+            argv=argv,
+            script_dir=str(path.parent),
+            hermes_home=str(_get_hermes_home()),
+            base_env=run_env,
+            timeout_secs=float(script_timeout),
+            sandbox_cfg=sandbox_cfg,
+        )
 
     try:
         popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
@@ -1243,6 +1260,17 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.error("Job '%s': %s", job_id, err)
             return False, "", "", err
 
+        # Resolve sandbox config for this job
+        _job_sandbox_cfg = None
+        try:
+            from cron.sandbox import _resolve_sandbox_config
+            _cfg = load_config() or {}
+            _job_sandbox_cfg = _resolve_sandbox_config(job, _cfg)
+            if _job_sandbox_cfg:
+                logger.info("Job '%s': nono sandbox enabled", job_id)
+        except Exception as exc:
+            logger.debug("Job '%s': sandbox config resolution failed: %s", job_id, exc)
+
         # Apply workdir if configured — lets scripts use predictable relative
         # paths. For no_agent jobs this is just the subprocess cwd (not an
         # agent TERMINAL_CWD bridge).
@@ -1256,7 +1284,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(script_path, sandbox_cfg=_job_sandbox_cfg)
         finally:
             if _prior_cwd is not None:
                 try:
@@ -1342,10 +1370,21 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
     # the whole agent run. We pass the result into _build_job_prompt so
     # the script is only executed once.
+    # Resolve sandbox config for pre-run scripts
+    _job_sandbox_cfg = None
+    try:
+        from cron.sandbox import _resolve_sandbox_config
+        _cfg_for_sandbox = load_config() or {}
+        _job_sandbox_cfg = _resolve_sandbox_config(job, _cfg_for_sandbox)
+        if _job_sandbox_cfg:
+            logger.info("Job '%s': nono sandbox enabled for pre-run script", job_id)
+    except Exception as exc:
+        logger.debug("Job '%s': sandbox config resolution failed: %s", job_id, exc)
+
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_job_script(script_path, sandbox_cfg=_job_sandbox_cfg)
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(

@@ -1,0 +1,339 @@
+"""
+Kernel-level sandboxing for cron job scripts using nono.
+
+Provides OS-enforced isolation (Landlock on Linux, Seatbelt on macOS)
+for pre-run scripts and no_agent scripts. The gateway process stays
+unsandboxed; only the child process executing the script is restricted.
+
+Configuration lives in two places:
+  - Global defaults: config.yaml → cron.sandbox
+  - Per-job overrides: jobs.json  → job.sandbox
+
+Per-job config inherits from global defaults. Explicit per-job fields
+override the corresponding global default.
+
+Requires: pip install nono-py
+"""
+
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+try:
+    import nono_py as nono
+    HAS_NONO = True
+except ImportError:
+    nono = None  # type: ignore[assignment]
+    HAS_NONO = False
+
+
+def is_available() -> bool:
+    """Check if nono is installed and the platform supports sandboxing."""
+    if not HAS_NONO:
+        return False
+    try:
+        return nono.is_supported()
+    except Exception:
+        return False
+
+
+def _resolve_sandbox_config(
+    job: Dict[str, Any],
+    global_config: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Merge per-job sandbox config with global defaults from config.yaml.
+
+    Returns None if sandboxing is disabled for this job.
+
+    Precedence (highest to lowest):
+      1. job["sandbox"] fields
+      2. config.yaml cron.sandbox.defaults
+      3. Built-in defaults (deny-all)
+
+    A job can opt out with {"sandbox": {"enabled": false}} even when
+    the global default enables sandboxing.
+    """
+    cron_cfg = global_config.get("cron", {}) or {}
+    global_sandbox = cron_cfg.get("sandbox", {}) or {}
+    global_defaults = global_sandbox.get("defaults", {}) or {}
+    global_enabled = global_sandbox.get("enabled", False)
+
+    job_sandbox = job.get("sandbox") or {}
+    job_enabled = job_sandbox.get("enabled")
+
+    # Determine if sandbox is active for this job
+    if job_enabled is False:
+        return None
+    if job_enabled is None and not global_enabled:
+        return None
+
+    # Merge: job overrides global defaults
+    merged: Dict[str, Any] = {}
+
+    # Filesystem
+    global_fs = global_defaults.get("filesystem", {}) or {}
+    job_fs = job_sandbox.get("filesystem", {}) or {}
+    merged["filesystem"] = {
+        "allow_read": job_fs.get("allow_read") or global_fs.get("allow_read", []),
+        "allow_write": job_fs.get("allow_write") or global_fs.get("allow_write", []),
+    }
+
+    # Network
+    global_net = global_defaults.get("network", {}) or {}
+    job_net = job_sandbox.get("network", {}) or {}
+    merged["network"] = {
+        "allow_hosts": job_net.get("allow_hosts") or global_net.get("allow_hosts", []),
+    }
+
+    # Credentials (proxy injection)
+    global_creds = global_defaults.get("credentials", {}) or {}
+    job_creds = job_sandbox.get("credentials", {}) or {}
+    # Job credentials override global per-key
+    all_creds = {**global_creds, **job_creds}
+    merged["credentials"] = all_creds
+
+    # Audit
+    global_audit = global_defaults.get("audit", {}) or {}
+    job_audit = job_sandbox.get("audit", {}) or {}
+    merged["audit"] = {
+        "enabled": job_audit.get("enabled", global_audit.get("enabled", False)),
+        "dir": job_audit.get("dir") or global_audit.get("dir"),
+    }
+
+    return merged
+
+
+def _expand_path(p: str) -> str:
+    """Expand ~ and environment variables in a path string."""
+    return str(Path(os.path.expandvars(os.path.expanduser(p))).resolve())
+
+
+def _build_capabilities(
+    sandbox_cfg: Dict[str, Any],
+    script_dir: str,
+    hermes_home: str,
+) -> "nono.CapabilitySet":
+    """Build a nono CapabilitySet from merged sandbox config.
+
+    Always grants:
+      - Read access to the script's directory
+      - Read access to system Python/bash paths needed for the interpreter
+    """
+    caps = nono.CapabilitySet()
+
+    # Always allow reading the script directory
+    caps.allow_path(script_dir, nono.AccessMode.READ)
+
+    fs_cfg = sandbox_cfg.get("filesystem", {})
+
+    for p in fs_cfg.get("allow_read", []):
+        expanded = _expand_path(p)
+        if os.path.exists(expanded):
+            caps.allow_path(expanded, nono.AccessMode.READ)
+
+    for p in fs_cfg.get("allow_write", []):
+        expanded = _expand_path(p)
+        parent = str(Path(expanded).parent)
+        if os.path.exists(parent):
+            caps.allow_path(expanded, nono.AccessMode.READ_WRITE)
+
+    net_cfg = sandbox_cfg.get("network", {})
+    if not net_cfg.get("allow_hosts"):
+        caps.block_network()
+
+    return caps
+
+
+def _build_env(
+    sandbox_cfg: Dict[str, Any],
+    base_env: Dict[str, str],
+) -> List[Tuple[str, str]]:
+    """Build a minimal env var list for the sandboxed child.
+
+    sandboxed_exec does NOT inherit parent env by default.
+    We pass through only what the script needs.
+    """
+    safe_keys = {
+        "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM",
+        "HERMES_HOME", "TMPDIR", "TZ",
+        "PYTHONPATH", "PYTHONIOENCODING",
+    }
+
+    env_list = []
+    for key in safe_keys:
+        val = base_env.get(key)
+        if val is not None:
+            env_list.append((key, val))
+
+    return env_list
+
+
+def _start_credential_proxy(
+    sandbox_cfg: Dict[str, Any],
+) -> Optional[Any]:
+    """Start a nono network proxy with credential injection if configured.
+
+    Each credential entry in the config maps to a RouteConfig that
+    intercepts requests and injects the real API key from an env var.
+    The sandboxed process only sees phantom tokens.
+    """
+    creds = sandbox_cfg.get("credentials", {})
+    net_cfg = sandbox_cfg.get("network", {})
+    allowed_hosts = net_cfg.get("allow_hosts", [])
+
+    if not creds and not allowed_hosts:
+        return None
+
+    routes = []
+    for name, cred_cfg in creds.items():
+        upstream = cred_cfg.get("upstream")
+        if not upstream:
+            continue
+
+        real_key = os.environ.get(cred_cfg.get("key_env", ""), "")
+        if not real_key:
+            logger.warning("Sandbox credential '%s': env var '%s' not set, skipping proxy route",
+                           name, cred_cfg.get("key_env", ""))
+            continue
+
+        route = nono.RouteConfig(
+            prefix=cred_cfg.get("prefix", "/"),
+            upstream=upstream,
+            credential_key=f"hermes-cron-{name}",
+            inject_mode=nono.InjectMode.HEADER,
+            inject_header=cred_cfg.get("inject_header", "Authorization"),
+            credential_format=cred_cfg.get("format", "Bearer {credential}"),
+        )
+        routes.append(route)
+
+    if not routes and not allowed_hosts:
+        return None
+
+    try:
+        config = nono.ProxyConfig(
+            allowed_hosts=allowed_hosts,
+            routes=routes,
+        )
+        return nono.start_proxy(config)
+    except Exception as exc:
+        logger.warning("Failed to start nono proxy: %s", exc)
+        return None
+
+
+def run_sandboxed_script(
+    argv: List[str],
+    script_dir: str,
+    hermes_home: str,
+    base_env: Dict[str, str],
+    timeout_secs: float,
+    sandbox_cfg: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """Execute a script inside a nono sandbox.
+
+    Returns (success, output) matching _run_job_script's contract.
+    """
+    if not is_available():
+        logger.warning("nono sandbox requested but not available, falling back to unsandboxed execution")
+        return _fallback_unsandboxed(argv, script_dir, base_env, timeout_secs)
+
+    caps = _build_capabilities(sandbox_cfg, script_dir, hermes_home)
+    env_list = _build_env(sandbox_cfg, base_env)
+
+    proxy = _start_credential_proxy(sandbox_cfg)
+    try:
+        if proxy:
+            proxy_env = proxy.sandbox_env()
+            env_list.extend(proxy_env.items() if hasattr(proxy_env, 'items') else proxy_env)
+
+        logger.info("Running script in nono sandbox: %s", " ".join(argv))
+        result = nono.sandboxed_exec(
+            caps,
+            argv,
+            cwd=script_dir,
+            timeout_secs=timeout_secs,
+            env=env_list,
+        )
+
+        stdout = (result.stdout.decode() if isinstance(result.stdout, bytes) else result.stdout or "").strip()
+        stderr = (result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr or "").strip()
+
+        try:
+            from agent.redact import redact_sensitive_text
+            stdout = redact_sensitive_text(stdout)
+            stderr = redact_sensitive_text(stderr)
+        except Exception:
+            pass
+
+        if proxy:
+            try:
+                events = proxy.drain_audit_events()
+                if events:
+                    logger.info("Sandbox audit: %d network events for script", len(events))
+            except Exception:
+                pass
+
+        if result.exit_code != 0:
+            parts = [f"Script exited with code {result.exit_code} (sandboxed)"]
+            if stderr:
+                parts.append(f"stderr:\n{stderr}")
+            if stdout:
+                parts.append(f"stdout:\n{stdout}")
+            return False, "\n".join(parts)
+
+        return True, stdout
+
+    except Exception as exc:
+        return False, f"Sandboxed script execution failed: {exc}"
+
+    finally:
+        if proxy:
+            try:
+                proxy.shutdown()
+            except Exception:
+                pass
+
+
+def _fallback_unsandboxed(
+    argv: List[str],
+    cwd: str,
+    env: Dict[str, str],
+    timeout: float,
+) -> Tuple[bool, str]:
+    """Fallback to subprocess.run when nono is not available."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+        )
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+
+        try:
+            from agent.redact import redact_sensitive_text
+            stdout = redact_sensitive_text(stdout)
+            stderr = redact_sensitive_text(stderr)
+        except Exception:
+            pass
+
+        if result.returncode != 0:
+            parts = [f"Script exited with code {result.returncode}"]
+            if stderr:
+                parts.append(f"stderr:\n{stderr}")
+            if stdout:
+                parts.append(f"stdout:\n{stdout}")
+            return False, "\n".join(parts)
+
+        return True, stdout
+
+    except subprocess.TimeoutExpired:
+        return False, f"Script timed out after {timeout}s"
+    except Exception as exc:
+        return False, f"Script execution failed: {exc}"
